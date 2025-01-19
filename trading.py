@@ -193,6 +193,25 @@ class TradingSystem:
     async def process_trading_signals(self, dataframe, symbol):
         """Process trading signals and execute trades"""
         try:
+            # Update price history for volatility checking
+            current_price = dataframe['close'].iloc[-1]
+            if symbol not in self.price_history:
+                self.price_history[symbol] = []
+            self.price_history[symbol].append(current_price)
+            self.price_history[symbol] = self.price_history[symbol][-10:]  # Keep last 10 prices
+            
+            # Check circuit breakers
+            breaker_type, triggered = await self.circuit_breaker.check_volatility_circuit_breaker(
+                symbol, current_price, self.price_history[symbol]
+            )
+            if triggered:
+                self.circuit_breaker.handle_breaker_trigger(breaker_type, self.notify)
+                return
+                
+            if not await self.circuit_breaker.can_trade():
+                return
+                
+            # Process trading signals
             positions = self.trading_client.get_all_positions()
             score = self.analysis.calculate_score(dataframe.iloc[-1], symbol)
             
@@ -245,51 +264,188 @@ class TradingSystem:
             return None
 
     async def optimize_portfolio(self):
-        """Optimize portfolio before market close"""
+        """Optimize portfolio before market close and decide on overnight positions"""
         try:
             positions = self.trading_client.get_all_positions()
             position_analysis = []
             
             for position in positions:
-                # Get recent data
-                bars_request = StockBarsRequest(
-                    symbol_or_symbols=position.symbol,
-                    timeframe=TimeFrame.Minute,
-                    limit=100
-                )
-                bars = self.data_client.get_stock_bars(bars_request)
-                
-                if bars and position.symbol in bars:
-                    df = pd.DataFrame([bar.dict() for bar in bars[position.symbol]])
-                    if not df.empty:
-                        df = self.analysis.initialize_indicators(df)
-                        score = self.analysis.calculate_score(df.iloc[-1], position.symbol)
-                        
-                        position_analysis.append({
-                            'symbol': position.symbol,
-                            'quantity': int(position.qty),
-                            'score': score,
-                            'unrealized_plpc': float(position.unrealized_plpc)
-                        })
-            
-            # Sort positions by score
-            position_analysis.sort(key=lambda x: x['score'])
-            
-            # Close bottom 30% of positions
-            positions_to_close = position_analysis[:int(len(position_analysis) * 0.3)]
-            for position in positions_to_close:
-                if position['unrealized_plpc'] < -0.02:
-                    order_data = MarketOrderRequest(
-                        symbol=position['symbol'],
-                        qty=position['quantity'],
-                        side=OrderSide.SELL,
-                        time_in_force=TimeInForce.DAY
+                try:
+                    # Get both intraday and daily data for comprehensive analysis
+                    intraday_request = StockBarsRequest(
+                        symbol_or_symbols=position.symbol,
+                        timeframe=TimeFrame.Minute,
+                        limit=390  # Full trading day
                     )
-                    await self.submit_order(order_data)
-                    print(f"Closed position in {position['symbol']} due to poor performance")
+                    daily_request = StockBarsRequest(
+                        symbol_or_symbols=position.symbol,
+                        timeframe=TimeFrame.Day,
+                        limit=10  # Last 10 days
+                    )
+                    
+                    intraday_bars = self.data_client.get_stock_bars(intraday_request)
+                    daily_bars = self.data_client.get_stock_bars(daily_request)
+                    
+                    if intraday_bars and daily_bars and position.symbol in intraday_bars and position.symbol in daily_bars:
+                        # Analyze intraday momentum
+                        intraday_df = pd.DataFrame([bar.dict() for bar in intraday_bars[position.symbol]])
+                        daily_df = pd.DataFrame([bar.dict() for bar in daily_bars[position.symbol]])
+                        
+                        if not intraday_df.empty and not daily_df.empty:
+                            # Technical analysis
+                            intraday_df = self.analysis.initialize_indicators(intraday_df)
+                            daily_df = self.analysis.initialize_indicators(daily_df)
+                            
+                            # Calculate key metrics
+                            current_price = float(position.current_price)
+                            entry_price = float(position.avg_entry_price)
+                            unrealized_plpc = float(position.unrealized_plpc)
+                            
+                            # Analyze end of day momentum
+                            last_hour_change = (current_price - intraday_df['close'].iloc[-60]) / intraday_df['close'].iloc[-60]
+                            volume_surge = intraday_df['volume'].iloc[-30:].mean() > intraday_df['volume'].iloc[:-30].mean() * 1.2
+                            
+                            # Daily trend analysis
+                            daily_trend = (daily_df['ema5'].iloc[-1] > daily_df['ema20'].iloc[-1])
+                            extended_hours_interest = await self.check_after_hours_interest(position.symbol)
+                            
+                            # Get sentiment and overnight holding score
+                            sentiment = self.analysis.analyze_sentiment(position.symbol)
+                            overnight_score = await self.calculate_overnight_score(
+                                daily_trend=daily_trend,
+                                last_hour_momentum=last_hour_change,
+                                volume_surge=volume_surge,
+                                sentiment=sentiment,
+                                extended_hours_interest=extended_hours_interest,
+                                unrealized_plpc=unrealized_plpc,
+                                technical_score=self.analysis.calculate_score(intraday_df.iloc[-1], position.symbol)
+                            )
+                            
+                            position_analysis.append({
+                                'symbol': position.symbol,
+                                'quantity': int(position.qty),
+                                'overnight_score': overnight_score,
+                                'unrealized_plpc': unrealized_plpc,
+                                'current_price': current_price,
+                                'entry_price': entry_price,
+                                'last_hour_change': last_hour_change,
+                                'volume_surge': volume_surge,
+                                'sentiment': sentiment
+                            })
+                            
+                except Exception as e:
+                    print(f"Error analyzing position {position.symbol}: {str(e)}")
+                    continue
             
-            return [p['symbol'] for p in position_analysis[int(len(position_analysis) * 0.3):]]
+            if position_analysis:
+                # Sort positions by overnight score
+                position_analysis.sort(key=lambda x: x['overnight_score'])
+                
+                # Analyze which positions to close
+                for position in position_analysis:
+                    hold_overnight = await self.should_hold_overnight(position)
+                    
+                    if not hold_overnight:
+                        order_data = MarketOrderRequest(
+                            symbol=position['symbol'],
+                            qty=position['quantity'],
+                            side=OrderSide.SELL,
+                            time_in_force=TimeInForce.DAY
+                        )
+                        await self.submit_order(order_data)
+                        
+                        message = (
+                            f"Closing position in {position['symbol']}:\n"
+                            f"Entry: ${position['entry_price']:.2f}\n"
+                            f"Exit: ${position['current_price']:.2f}\n"
+                            f"P&L: {position['unrealized_plpc']:.2%}\n"
+                            f"Reason: Low overnight potential"
+                        )
+                        print(message)
+                        self.notify(message)
+                
+                # Keep track of positions we're holding overnight
+                return [p['symbol'] for p in position_analysis if await self.should_hold_overnight(p)]
+            
+            return []
             
         except Exception as e:
             print(f"Error in portfolio optimization: {str(e)}")
             return []
+
+    async def check_after_hours_interest(self, symbol):
+        """Check for after-hours trading interest"""
+        try:
+            snapshot_request = StockSnapshotRequest(symbol_or_symbols=symbol)
+            snapshot = self.data_client.get_stock_snapshot(snapshot_request)
+            
+            if snapshot and snapshot.latest_trade and snapshot.latest_quote:
+                regular_volume = snapshot.latest_trade.volume
+                current_volume = snapshot.latest_quote.volume
+                
+                # Calculate after-hours volume ratio
+                after_hours_ratio = (current_volume - regular_volume) / regular_volume
+                return after_hours_ratio > 0.1  # More than 10% additional volume
+            
+            return False
+        except Exception as e:
+            print(f"Error checking after-hours interest for {symbol}: {str(e)}")
+            return False
+
+    async def calculate_overnight_score(self, **kwargs):
+        """Calculate score for overnight holding potential"""
+        try:
+            score = 0
+            
+            # Technical and trend factors (40%)
+            if kwargs.get('daily_trend', False):
+                score += 20
+            if kwargs.get('last_hour_momentum', 0) > 0.01:  # 1% uptick
+                score += 10
+            if kwargs.get('volume_surge', False):
+                score += 10
+                
+            # Sentiment and interest factors (30%)
+            sentiment = kwargs.get('sentiment', 0)
+            score += sentiment * 20  # Convert -1 to 1 scale to -20 to 20
+            if kwargs.get('extended_hours_interest', False):
+                score += 10
+                
+            # Current position performance (30%)
+            technical_score = kwargs.get('technical_score', 0)
+            score += technical_score * 0.3
+            
+            # Penalty for losing positions
+            unrealized_plpc = kwargs.get('unrealized_plpc', 0)
+            if unrealized_plpc < -0.02:  # More than 2% loss
+                score -= 20
+            
+            return score
+            
+        except Exception as e:
+            print(f"Error calculating overnight score: {str(e)}")
+            return 0
+
+    async def should_hold_overnight(self, position):
+        """Determine if a position should be held overnight"""
+        try:
+            # Basic criteria for overnight holdings
+            if position['unrealized_plpc'] < -0.03:  # Don't hold significant losses
+                return False
+                
+            if position['overnight_score'] < 50:  # Below threshold score
+                return False
+                
+            # Check if we're in a strong uptrend
+            if position['last_hour_change'] < -0.02:  # Significant end-of-day weakness
+                return False
+                
+            # Volume confirmation
+            if not position['volume_surge'] and position['sentiment'] < 0:
+                return False
+                
+            return True
+            
+        except Exception as e:
+            print(f"Error evaluating overnight holding for {position['symbol']}: {str(e)}")
+            return False

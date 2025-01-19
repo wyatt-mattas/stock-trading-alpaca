@@ -1,173 +1,264 @@
+# error_recovery.py
+"""Enhanced error recovery and resilience system"""
 import asyncio
 import time
+from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass
+from enum import Enum
+
+class ErrorSeverity(Enum):
+    LOW = 1      # Recoverable without intervention
+    MEDIUM = 2   # Requires retry with modified parameters
+    HIGH = 3     # Requires system pause and reset
+    CRITICAL = 4 # Requires complete shutdown and restart
+
+@dataclass
+class ErrorContext:
+    error_type: str
+    component: str
+    timestamp: float
+    details: Dict[str, Any]
+    attempts: int = 0
 
 class ErrorRecovery:
-    def __init__(self, trading_client, data_client):
+    def __init__(self, trading_client, data_client, stream_client):
         self.trading_client = trading_client
         self.data_client = data_client
-        self.max_retries = 3
-        self.retry_delay = 5  # seconds
+        self.stream_client = stream_client
+        
+        # Error tracking
+        self.error_history = {}
         self.error_counts = {}
         self.error_cooldown = {}
-        self.cooldown_period = 300  # 5 minutes
         
-    async def handle_error(self, error, context):
-        """Handle different types of errors with appropriate recovery strategies"""
+        # Recovery settings
+        self.max_retries = 3
+        self.base_delay = 5  # seconds
+        self.cooldown_period = 300  # 5 minutes
+        self.error_window = 3600  # 1 hour for error rate calculation
+        
+        # Circuit breaker settings
+        self.error_threshold = 5  # errors per hour
+        self.circuit_breaker_cooldown = 900  # 15 minutes
+        
+    async def handle_error(self, error: Exception, context: Dict[str, Any]) -> bool:
+        """Main error handling entry point"""
         try:
             error_type = type(error).__name__
+            component = context.get('component', 'unknown')
             
-            # Update error counts
-            self.error_counts[error_type] = self.error_counts.get(error_type, 0) + 1
+            # Create error context
+            error_ctx = ErrorContext(
+                error_type=error_type,
+                component=component,
+                timestamp=time.time(),
+                details=context
+            )
             
-            # Check if in cooldown
-            current_time = time.time()
-            if error_type in self.error_cooldown:
-                if current_time < self.error_cooldown[error_type]:
-                    return False
-                    
-            # Handle specific error types
-            if isinstance(error, (ConnectionError, TimeoutError)):
-                return await self.handle_connection_error(error, context)
-            elif isinstance(error, RateLimitError): # TODO add RateLimitError
-                return await self.handle_rate_limit_error(error, context)
-            elif isinstance(error, AccountError): # TODO add AccountError
-                return await self.handle_account_error(error, context)
-            elif isinstance(error, OrderError): # TODO add OrderError
-                return await self.handle_order_error(error, context)
-            else:
-                return await self.handle_generic_error(error, context)
+            # Update error history
+            self.update_error_history(error_ctx)
+            
+            # Check error rate and circuit breakers
+            if not await self.check_error_rate(error_type):
+                return False
+                
+            # Determine error severity
+            severity = self.classify_error(error, context)
+            
+            # Handle based on severity
+            if severity == ErrorSeverity.LOW:
+                return await self.handle_low_severity(error_ctx)
+            elif severity == ErrorSeverity.MEDIUM:
+                return await self.handle_medium_severity(error_ctx)
+            elif severity == ErrorSeverity.HIGH:
+                return await self.handle_high_severity(error_ctx)
+            else:  # CRITICAL
+                return await self.handle_critical_error(error_ctx)
                 
         except Exception as e:
-            print(f"Error in error recovery: {str(e)}")
+            print(f"Error in error recovery system: {str(e)}")
             return False
 
-    async def handle_connection_error(self, error, context):
-        """Handle connection-related errors"""
-        for attempt in range(self.max_retries):
-            try:
-                print(f"Connection error recovery attempt {attempt + 1}/{self.max_retries}")
-                
-                # Wait before retry
-                await asyncio.sleep(self.retry_delay * (attempt + 1))
-                
-                # Attempt to reconnect
-                if context.get('stream'):
-                    await self.reconnect_stream(context['stream'])
-                if context.get('data_client'):
-                    await self.reconnect_data_client()
-                    
-                return True
-                
-            except Exception as e:
-                print(f"Error during connection recovery: {str(e)}")
-                
-        # If all retries failed, enter cooldown
-        self.error_cooldown[type(error).__name__] = time.time() + self.cooldown_period
-        return False
+    def classify_error(self, error: Exception, context: Dict[str, Any]) -> ErrorSeverity:
+        """Classify error severity based on type and context"""
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            return ErrorSeverity.MEDIUM
+        elif "rate limit" in str(error).lower():
+            return ErrorSeverity.LOW
+        elif "insufficient funds" in str(error).lower():
+            return ErrorSeverity.HIGH
+        elif "invalid symbol" in str(error).lower():
+            return ErrorSeverity.LOW
+        elif "account blocked" in str(error).lower():
+            return ErrorSeverity.CRITICAL
+        elif context.get('component') == 'stream':
+            return ErrorSeverity.HIGH
+        else:
+            return ErrorSeverity.MEDIUM
 
-    async def handle_rate_limit_error(self, error, context):
-        """Handle rate limit errors"""
-        try:
-            # Calculate appropriate backoff time
-            backoff_time = min(60, self.retry_delay * (2 ** self.error_counts.get('RateLimitError', 0)))
-            print(f"Rate limit reached. Backing off for {backoff_time} seconds")
+    async def handle_low_severity(self, error_ctx: ErrorContext) -> bool:
+        """Handle low severity errors with simple retry"""
+        if error_ctx.attempts >= self.max_retries:
+            return False
             
-            await asyncio.sleep(backoff_time)
+        delay = self.base_delay * (2 ** error_ctx.attempts)
+        await asyncio.sleep(delay)
+        error_ctx.attempts += 1
+        return True
+
+    async def handle_medium_severity(self, error_ctx: ErrorContext) -> bool:
+        """Handle medium severity errors with recovery actions"""
+        try:
+            if error_ctx.attempts >= self.max_retries:
+                return False
+                
+            # Attempt recovery based on component
+            if error_ctx.component == 'data':
+                await self.recover_data_client()
+            elif error_ctx.component == 'stream':
+                await self.recover_stream()
+            elif error_ctx.component == 'trading':
+                await self.recover_trading_client()
+                
+            delay = self.base_delay * (2 ** error_ctx.attempts)
+            await asyncio.sleep(delay)
+            error_ctx.attempts += 1
             return True
             
         except Exception as e:
-            print(f"Error handling rate limit: {str(e)}")
+            print(f"Error in medium severity recovery: {str(e)}")
             return False
 
-    async def handle_account_error(self, twilio_client):
-        """Handle account-related errors"""
+    async def handle_high_severity(self, error_ctx: ErrorContext) -> bool:
+        """Handle high severity errors with system pause"""
         try:
-            print("Account error detected. Verifying account status...")
+            # Close all positions if trading-related
+            if error_ctx.component == 'trading':
+                await self.close_all_positions()
             
-            # Verify account status
-            account = self.trading_client.get_account()
+            # Reset connections
+            await self.reset_connections()
             
-            if account.trading_suspended:
-                message = "Trading suspended. Closing all positions."
-                print(message)
-                self.trading_client.close_all_positions()
-                
-                twilio_client.messages.create(
-                    from_='+13343732933',
-                    to='+16207578055',
-                    body=message
-                )
-                return False
-                
+            # Cooldown period
+            await asyncio.sleep(self.circuit_breaker_cooldown)
+            
+            return error_ctx.attempts < 1  # Only try once
+            
+        except Exception as e:
+            print(f"Error in high severity recovery: {str(e)}")
+            return False
+
+    async def handle_critical_error(self, error_ctx: ErrorContext) -> bool:
+        """Handle critical errors requiring shutdown"""
+        try:
+            # Emergency position closing
+            await self.close_all_positions()
+            
+            # Stop all streams and connections
+            await self.shutdown_connections()
+            
+            # Signal for complete restart
+            raise SystemExit("Critical error triggered shutdown")
+            
+        except Exception as e:
+            print(f"Error in critical error handling: {str(e)}")
+            return False
+
+    async def recover_data_client(self) -> bool:
+        """Attempt to recover data client connection"""
+        try:
+            # Reset data client connection
+            self.data_client = type(self.data_client)(
+                self.data_client.api_key,
+                self.data_client.secret_key
+            )
             return True
-            
         except Exception as e:
-            print(f"Error handling account error: {str(e)}")
+            print(f"Error recovering data client: {str(e)}")
             return False
 
-    async def handle_order_error(self, error, context, df_ticker_list, ticker_list):
-        """Handle order-related errors"""
+    async def recover_stream(self) -> bool:
+        """Attempt to recover streaming connection"""
         try:
-            order_data = context.get('order_data')
-            if not order_data:
-                return False
-                
-            # Retry with modified order
-            if "insufficient buying power" in str(error).lower():
-                # Reduce order size by 25%
-                order_data.qty = int(order_data.qty * 0.75)
-                if order_data.qty > 0:
-                    self.trading_client.submit_order(order_data)
-                    return True
-                    
-            elif "invalid symbol" in str(error).lower():
-                # Remove symbol from tracking
-                symbol = order_data.symbol
-                if symbol in df_ticker_list:
-                    del df_ticker_list[symbol]
-                if symbol in ticker_list:
-                    ticker_list.remove(symbol)
-                    
-            return False
-            
-        except Exception as e:
-            print(f"Error handling order error: {str(e)}")
-            return False
-
-    async def handle_generic_error(self, error, context):
-        """Handle unknown errors"""
-        try:
-            print(f"Unhandled error: {str(error)}")
-            
-            # If error count is too high, enter cooldown
-            if self.error_counts.get(type(error).__name__, 0) >= self.max_retries:
-                self.error_cooldown[type(error).__name__] = time.time() + self.cooldown_period
-                return False
-                
-            # Wait before retry
-            await asyncio.sleep(self.retry_delay)
-            return True
-            
-        except Exception as e:
-            print(f"Error handling generic error: {str(e)}")
-            return False
-
-    async def reconnect_stream(self, stream):
-        """Attempt to reconnect streaming connection"""
-        try:
-            stream.stop()
+            # Stop existing stream
+            self.stream_client.stop()
             await asyncio.sleep(1)
-            stream.run()
+            
+            # Create new stream connection
+            self.stream_client = type(self.stream_client)(
+                self.stream_client.api_key,
+                self.stream_client.secret_key
+            )
             return True
         except Exception as e:
-            print(f"Error reconnecting stream: {str(e)}")
+            print(f"Error recovering stream: {str(e)}")
             return False
 
-    async def reconnect_data_client(self, data_client):
-        """Attempt to reconnect data client"""
+    async def recover_trading_client(self) -> bool:
+        """Attempt to recover trading client connection"""
         try:
-            self.data_client = data_client
+            # Reset trading client connection
+            self.trading_client = type(self.trading_client)(
+                self.trading_client.api_key,
+                self.trading_client.secret_key
+            )
             return True
         except Exception as e:
-            print(f"Error reconnecting data client: {str(e)}")
+            print(f"Error recovering trading client: {str(e)}")
             return False
+
+    async def close_all_positions(self) -> bool:
+        """Emergency close all positions"""
+        try:
+            return bool(self.trading_client.close_all_positions())
+        except Exception as e:
+            print(f"Error closing positions: {str(e)}")
+            return False
+
+    async def reset_connections(self) -> None:
+        """Reset all client connections"""
+        await asyncio.gather(
+            self.recover_data_client(),
+            self.recover_stream(),
+            self.recover_trading_client()
+        )
+
+    async def shutdown_connections(self) -> None:
+        """Shutdown all connections"""
+        try:
+            self.stream_client.stop()
+            # Add any additional cleanup needed
+        except Exception as e:
+            print(f"Error in shutdown: {str(e)}")
+
+    def update_error_history(self, error_ctx: ErrorContext) -> None:
+        """Update error tracking history"""
+        current_time = time.time()
+        error_type = error_ctx.error_type
+        
+        if error_type not in self.error_history:
+            self.error_history[error_type] = []
+        
+        self.error_history[error_type].append(current_time)
+        
+        # Clean old errors
+        self.error_history[error_type] = [
+            t for t in self.error_history[error_type]
+            if current_time - t <= self.error_window
+        ]
+
+    async def check_error_rate(self, error_type: str) -> bool:
+        """Check if error rate exceeds threshold"""
+        current_time = time.time()
+        
+        if error_type in self.error_cooldown:
+            if current_time < self.error_cooldown[error_type]:
+                return False
+                
+        error_count = len(self.error_history.get(error_type, []))
+        
+        if error_count >= self.error_threshold:
+            self.error_cooldown[error_type] = current_time + self.circuit_breaker_cooldown
+            return False
+            
+        return True
